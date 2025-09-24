@@ -1,23 +1,103 @@
-import time
-import json
-import cv2
-import requests
-import sys
-import numpy as np
-from ultralytics import YOLO
-from datetime import datetime
-from colorama import init, Fore, Back, Style
-from geopy.geocoders import Nominatim
 from openai import OpenAI
+import requests
+import base64
+import json
+import numpy as np
+from geopy.geocoders import Nominatim
+import sounddevice as sd
+import cv2
+import time
+import os
+import csv
+import pandas as pd
+import joblib
+
+from colorama import init, Fore, Back, Style
+from tabulate import tabulate
+from metpy.calc import dewpoint_from_relative_humidity, dewpoint
+from metpy.units import units
+from ultralytics import YOLO
+from multiprocessing import Process
+from datetime import datetime, timedelta
+from mediapipe.tasks import python
+from mediapipe.tasks.python.components import containers
+from mediapipe.tasks.python import audio
+from scipy.io import wavfile
+from scipy.io import wavfile
+from scipy.io.wavfile import write as wavwrite
 
 init(autoreset=True)
 
-OPENAI_MODEL = 'gpt-5-nano'
-API_URL = 'http://10.19.71.68:1337'
-ESP_32_CAM_URL = 'http://10.19.71.100/capture'
+CameraURL = ''
+ApiUrl = 'http://10.19.71.68:1337'
+ApiKey = ''
+PromptGPTCamera = '''
+Eres un sistema de análisis de imágenes especializado en detección temprana de incendios forestales. 
+Analiza la imagen proporcionada y determina:
 
-model = YOLO('models/FireAndSmoke.pt')
+- Si hay presencia de humo.
+- Si hay presencia de fuego.
+- Nivel de certeza de cada detección (en %).
+- Breve descripción visual de la escena.
 
+Devuelve el resultado estrictamente en formato JSON con la siguiente estructura:
+
+{
+  "humo": booleano,
+  "fuego": booleano,
+  "certeza_humo_porcentaje": número,
+  "certeza_fuego_porcentaje": número,
+  "descripcion_visual": "texto breve"
+}
+
+Reglas:
+- Si no se detecta humo o fuego, retorna false y un porcentaje de certeza bajo.
+- No incluyas explicaciones fuera del JSON.
+- El JSON debe ser válido.
+
+'''
+PromptGPTReport = '''
+Eres un sistema experto en detección temprana de incendios forestales. 
+Tu tarea es analizar datos de sensores ambientales y entregar un informe en formato JSON.
+
+Datos que recibirás:
+- MQ-2 (PPM de gases combustibles y humo)
+- Velocidad del viento (km/h)
+- Temperatura (°C)
+- Humedad (%)
+- Latitud (lat)
+- Longitud (lon)
+- Dirección del viento (grados o cardinal)
+
+Requisitos del análisis:
+1. Evalúa la probabilidad de incendio forestal en base a los datos.
+2. Identifica condiciones críticas (alta temperatura, baja humedad, alta concentración de humo/gases, viento fuerte).
+3. Genera un nivel de alerta: "Bajo", "Medio", "Alto", "Crítico".
+4. Incluye recomendaciones inmediatas (ejemplo: monitoreo, alerta preventiva, despacho de brigada).
+5. Usa siempre JSON bien estructurado, sin texto adicional fuera del JSON.
+6. Solo di lo necesario.
+
+Formato de salida JSON:
+{
+  "ubicacion": {
+    "lat": <valor>,
+    "lon": <valor>
+  },
+  "condiciones": {
+    "temperatura_c": <valor>,
+    "humedad_%": <valor>,
+    "mq2_ppm": <valor>,
+    "velocidad_viento_ms": <valor>,
+    "direccion_viento": "<valor>"
+  },
+  "analisis": {
+    "riesgo_incendio": "<Bajo|Medio|Alto|Crítico>",
+    "factores_determinantes": ["<lista de factores>"],
+    "recomendaciones": ["<acciones sugeridas>"]
+  },
+  "timestamp": "<fecha-hora UTC>"
+}
+'''
 banner = '''
 _________                __  .__              .__          
 \\_   ___ \\  ____   _____/  |_|__| ____   ____ |  | _____   
@@ -34,20 +114,25 @@ _________                __  .__              .__
 
 '''
 
-def get_kmph(lat, lon):
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=wind_speed_10m"
-    response = requests.get(url)
-    data = response.json()
-    wind_speed = data['hourly']['wind_speed_10m'][0]
-    return wind_speed
+client = OpenAI(api_key=ApiKey)
+model = YOLO('models/FireAndSmoke.pt')
 
-def detect_fire_risk(humidity, temperature, wind_speed):
-    if humidity < 30 and temperature > 30 and wind_speed > 30:
-        return 2
-    if humidity < 35 and temperature > 25 and wind_speed > 25:
-        return 1
-    else:
+
+def rule_thirty(temperature: int, humidity: int, wind_speed: int):
+    if temperature >= 30 and humidity <= 30 and wind_speed >= 30:
         return 0
+    
+    elif temperature >= 25 and humidity <= 35 and wind_speed >= 25:
+        return 1
+    
+    else:
+        return 2
+
+
+def get_sensor_data():
+    response = requests.get(ApiUrl + '/api/sensor_data').json()[0]
+
+    return response
 
 def get_address(lat, lon):
     geolocator = Nominatim(user_agent="Centinela/1.0.0")
@@ -56,114 +141,105 @@ def get_address(lat, lon):
         return location.address
     else:
         return None
-    
-def fire_report(nombre_ubicacion, latitud, longitud, temperatura_celsius, humedad_porcentaje, viento_kmh, humo_detectado, fecha_hora=None):
-    prompt = '''
-Eres un asistente experto en análisis ambiental para detección temprana de incendios forestales, busca en internet informacion climatica, geografica, vegetacion, y mas cosas para mejorar el informe, el umbral del MQ 2, son entre 700-+1000, eso significa que eso no podria sobrepasar.,
-Recomienda buenas acciones y recomendaciones, no cualquiera, las necesarias, si no se requieren acciones o recomendaciones no pongas nada, solo pon lo necesario segun las condiciones que te pasare, te recalco que solo digas lo justo y necesario.
-Te entregaré datos de sensores y condiciones meteorológicas para evaluar el riesgo según la regla 30-30-30 (temperatura > 30°C, humedad < 30%, viento > 30 km/h). Debes generar un informe en formato JSON con la siguiente estructura:
+        
+def chainsaw_detect(audioFile: str):
+    possible_chainsaw_options = [
+        'Power tool', 'Aircraft', 'Tools', 'Helicopter', 'Drill'
+    ]
 
-{
-  "fecha_hora": "string con fecha y hora ISO 8601",
-  "ubicacion": {
-    "nombre": "nombre del lugar",
-    "latitud": número decimal,
-    "longitud": número decimal
-  },
-  "datos_sensores": {
-    "temperatura_celsius": número,
-    "humedad_porcentaje": número,
-    "viento_kmh": número,
-    "humo_detectado": número
-  },
-  "evaluacion_regla_30_30_30": {
-    "cumple_regla": booleano,
-    "descripcion_estado": "texto explicativo del estado"
-  },
-  "informe_texto": "un resumen claro y en texto plano sobre las condiciones y riesgo",
-  "recomendaciones": [
-    "lista de recomendaciones concretas"
-  ],
-  "acciones_sugeridas": [
-    {
-      "accion": "acción específica a realizar",
-      "prioridad": "alta/media/baja"
-    }
-}'''+f'''
+    while True:
+        
+        detections = []
 
-Datos de entrada:
-Fecha y hora: {fecha_hora}
-Lugar: {nombre_ubicacion}, latitud {latitud}, longitud {longitud}
-Temperatura: {temperatura_celsius} °C
-  ],
-  "estado_alarma": "activada/desactivada",
-  "notas_adicionales": "cualquier otra información útil"
-Humedad: {humedad_porcentaje} %
-Viento: {viento_kmh} km/h
-Humo Sensor MQ-2 Analogico: {humo_detectado}
+        recording = sd.rec(int(10 * 16000), samplerate=16000, channels=1, dtype='int16')
+        sd.wait()
+        wavwrite(audioFile, 16000, recording)
 
-Genera la respuesta JSON sin explicaciones adicionales.
+        base_options = python.BaseOptions(model_asset_path='models/yamnet.tflite')
+        options = audio.AudioClassifierOptions(base_options=base_options, max_results=4)
 
-'''
-    
-    #geolocator = Nominatim(user_agent='Centinela/1.0.0')
-    #location = geolocator.reverse((latitud, longitud))
+        with audio.AudioClassifier.create_from_options(options) as classifier:
+            sample_rate, wav_data = wavfile.read(audioFile)
 
-    client = OpenAI(
-        api_key=''
-    )
+            audio_clip = containers.AudioData.create_from_array(
+                wav_data.astype(float) / np.iinfo(np.int16).max, sample_rate)
+            
+            classification_result_list = classifier.classify(audio_clip)
 
-    completion = client.chat.completions.create(
-        model=OPENAI_MODEL, # gpt-4o-mini-search-preview
-        #web_search_options={
-        #    'user_location': {
-        #        'type': 'approximate',
-        #        'approximate': {
-        #            'country': 'CL',
-        #            'city': location.raw['address']['city'],
-        #            'region': location.raw['address']['state'],
-        #        }
-        #    }
-        #}, 
-        messages=[
-            {
-                'role': 'user',
-                'content': prompt
-            }
-        ]
-    )
+            for idx, timestamp in enumerate([0, 975, 1950, 2925]):
+                classification_result = classification_result_list[idx]
+                top_category = classification_result.classifications[0].categories[0]
 
-    return completion.choices[0].message.content
+                detections.append(top_category.category_name)
 
-def get_sensor_data():
-    response = requests.get('http://10.19.71.68:1337/api/sensor_data')
+        if detections:
+            if detections.count('chainsaws') >= 2:
+                print('motosierra detectada')
 
+        for p in possible_chainsaw_options:
+            if detections.count(p) >= 2:
+                print('posible motosierra detectada')
+            
 
-    return json.loads(response.text)[0]
+def gpt_send_message(prompt, image=None, model='gpt-5-nano'):
+    message = [
+        {
+            'role': 'user',
+            'content': [
+                {'type': 'input_text', 'text': prompt}
+            ]
+        }
+    ]
 
+    if image:
+        message[0]['content'].append({'type': 'input_image', 'image_url': f'data:image/png;base64,{image}'})
 
+    response = client.responses.create(model=model, input=message)
 
-def main(lat, lon):
-    reports = 0
-    last_report = time.time()
-    last_report_data = None
-    last_kmph_request = time.time()
+    return response.output_text
+
+def generate_fire_reports(lat, lon):
     last_fire_detection = time.time()
-    kmph_value = None
-    last_status = None
+    reports = 0
+    om = OpenMeteo(lat, lon)
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    while True:
+        if time.time() - last_fire_detection >= 3600 or reports == 0:
+            wind_dir = requests.get(f'https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=wind_direction_10m').json()['current']['wind_direction_10m']
 
-    print(banner)
-    print(f"[{now}] {Back.BLUE}{Fore.WHITE}ESP32 CAM{Style.RESET_ALL} Iniciando camara")
+            sensors = get_sensor_data()
+
+            datos_sensores = f'''
+            Temperatura: {sensors['temperature']},
+            Humedad: {sensors['humidity']},
+            Velocidad viento: {om.get_wind_speed()},
+            Direccion Viento: {wind_dir} Grados
+            Latitud: {lat},
+            Longitud: {lon}
+            Direccion: {get_address(lat, lon)}
+            '''
+
+
+            response = gpt_send_message(
+                PromptGPTReport + datos_sensores
+            ) 
+
+            
+            last_fire_detection = time.time()
+            reports += 1
+
+            print(response)
+
+def camera_detection_yolov8():
+    global smoke_detected
+    global fire_detected
 
     while True:
         smoke_detected = False
         fire_detected = False
-        fire_and_smoke_detected = False
 
         try:
-            resp = requests.get(ESP_32_CAM_URL, timeout=2)
+            resp = requests.get(CameraURL, timeout=2)
             img_arr = np.frombuffer(resp.content, np.uint8)
             frame = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
         except Exception as e:
@@ -182,90 +258,342 @@ def main(lat, lon):
                 if class_ in ['smoke']:
                     smoke_detected = True
 
-
-        # Mostrar la imagen con OpenCV
         cv2.imshow('Centinela', frame)
 
-        # Salir con 'q' o ESC
         key = cv2.waitKey(1) & 0xFF  
         if key == 27 or key == ord('q'):
             break
 
-        # Pequeña espera para no saturar la cámara
-        time.sleep(0.1)
+def rule_thirty_exec(lat, lon):
+    om = OpenMeteo(lat, lon)
 
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    while True:
+            sensors = get_sensor_data()
 
-        if time.time() - last_fire_detection >= 30:
-            if fire_and_smoke_detected:
-                print(f"[{now}] {Back.BLUE}{Fore.WHITE}ESP32 CAM{Style.RESET_ALL} FUEGO Y HUMO {Back.RED}DETECTADO{Style.RESET_ALL}")
-                requests.post(API_URL + '/api/alert', json={'ai_status': 'fire_and_smoke_detected'})
+            risk = rule_thirty(sensors['temperature'], sensors['humidity'], om.get_wind_speed())
 
-            if fire_detected:
-                print(f"[{now}] {Back.BLUE}{Fore.WHITE}ESP32 CAM{Style.RESET_ALL} FUEGO {Back.RED}DETECTADO{Style.RESET_ALL}")
-                requests.post(API_URL + '/api/alert', json={'ai_status': 'fire_detected'})
+            if risk == 0:
+                print('[regra dos 30] riesgo de incendio maximo')
 
-            if smoke_detected:
-                print(f"[{now}] {Back.BLUE}{Fore.WHITE}ESP32 CAM{Style.RESET_ALL} Humo {Back.YELLOW}Detectado{Style.RESET_ALL}")
-                requests.post(API_URL + '/api/alert', json={'ai_status': 'smoke_detected'})
+            elif risk == 1:
+                print('[regra dos 30] riesgo de incendio medio')
 
-            last_fire_detection = time.time()
+            elif risk == 2:
+                print('[regra dos 30] riesgo de incendio bajo')
+
+            time.sleep(10)
+
+def predict_fire(lat, lon):
+    om = OpenMeteo(lat, lon)
+    model = joblib.load('models/FirePrediction.pkl')
+    while True:
+        month = int(datetime.now().strftime('%m'))
+
+        if month in [12, 1, 2]:
+            season = 2
+        elif month in [3, 4, 5]:
+            season = 0
+
+        elif month in [6, 7, 8]:
+            season = 3
+
+        elif month in [9, 10, 11]:
+            season = 1
+
+        temps = om.get_maxmin_temp()
+        maxtemp = (temps[0] * 9/5) + 32
+        mintemp = (temps[1] * 9/5) + 32
+        windspeed = om.get_wind_speed() * 0.621371
+        temprange = maxtemp - mintemp
+        windtempratio = windspeed / maxtemp
+        today = datetime.today().timetuple().tm_yday
+
+        p = model.predict(
+            [
+                [om.get_precipitation(), maxtemp, mintemp, windspeed, 2025, temprange, windtempratio, 9, season, om.get_lagged_precipitation(), om.get_lagged_windspeed(), today]
+            ]
+        )
+
+        if p == 0 or p == [0]:
+            print('[ml model] No hay riesgo de incendio para hoy')
+
+        else:
+            print('[ml model] Hay riesgo de incendio para hoy')
+        break
+
+def recopile_nesterov_data(lat ,lon):
+
+    while True:
+        rows = []
+        today = datetime.now().strftime('%d-%m')
+        hour = datetime.now().strftime('%H:%M')    
+
+        with open('data/nesterov.csv') as csvread:
             
+            reader = csv.reader(csvread)
 
-        
+            for row in reader:
+                rows.append(row[0])
+
+            if rows[-1] != today and hour.startswith('15'):
+                sensors = get_sensor_data()
+
+                T15 = sensors['temperature']
+                Tdew = float(dewpoint_from_relative_humidity(T15 * units.degC, sensors['humidity'] * units.percent).m)
+                rain = OpenMeteo(lat, lon).get_precipitation()
+
+                with open('data/nesterov.csv', 'a', newline='') as csvwrite:
+                    writer = csv.writer(csvwrite)
+                    writer.writerow([today, hour, T15, Tdew, rain])
+
+        time.sleep(10)
+
+def check_ppm_gases():
+    while True:
         sensors = get_sensor_data()
 
-        if time.time() - last_kmph_request >= 30:
-            last_kmph_request = time.time()
+        co = sensors['co']
+        ch4 = sensors['ch4']
+        co2 = sensors['co2']
+        smoke = sensors['smoke']
 
-            fire_risk = detect_fire_risk(
-                sensors['humidity'],
-                sensors['temperature'],
-                get_kmph(lat, lon)
-            )
-
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            if fire_risk == 0:
-                print(f"[{now}] {Back.LIGHTYELLOW_EX}{Fore.BLACK}FIRE RISK{Style.RESET_ALL}{Style.RESET_ALL} {Fore.GREEN}No hay alerta{Fore.WHITE} de incendio{Style.RESET_ALL}")
-                requests.post(API_URL + '/api/alert', json={'alert_status': 'max_alert'})
-
-
-            if fire_risk == 1:
-                print(f"[{now}] {Back.LIGHTYELLOW_EX}{Fore.WHITE}FIRE RISK{Style.RESET_ALL}{Style.RESET_ALL} {Fore.YELLOW}Alerta{Fore.WHITE}: Condiciones propensas a incendios{Style.RESET_ALL}")
-                requests.post(API_URL + '/api/alert', json={'alert_status': 'medium_alert'})
-
-            if fire_risk == 2:
-                print(f"[{now}] {Back.RED}{Fore.WHITE}FIRE RISK{Style.RESET_ALL}{Style.RESET_ALL} {Back.RED}{Fore.WHITE}¡Peligro! Condiciones extremas para incendios{Style.RESET_ALL}")
-                requests.post(API_URL + '/api/alert', json={'alert_status': 'low_alert'})
-
-            last_kmph_request = time.time()
-
-        if reports == 0 or (time.time() - last_report >= 3600):
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f'[{now}] {Back.WHITE}{Fore.BLACK}{OPENAI_MODEL}{Style.RESET_ALL} Generando informe...')
-
-            report = json.loads(fire_report(
-                get_address(lat, lon),
-                lat,
-                lon,
-                sensors['temperature'],
-                sensors['humidity'],
-                get_kmph(lat, lon),
-                sensors['smoke'],
-                now
-            ))
-
-            requests.post(API_URL + '/api/report', json=report)
-
-            print(f'[{now}] {Back.WHITE}{Fore.BLACK}{OPENAI_MODEL}{Style.RESET_ALL} Descripcion informe: {report['informe_texto']}')
-            print(f'[{now}] {Back.WHITE}{Fore.BLACK}{OPENAI_MODEL}{Style.RESET_ALL} Descripcion 30-30-30: {report['evaluacion_regla_30_30_30']['descripcion_estado']}')
-            print(f'[{now}] {Back.WHITE}{Fore.BLACK}{OPENAI_MODEL}{Style.RESET_ALL} Total de recomendaciones: {len(report['recomendaciones'])}')
-            print(f'[{now}] {Back.WHITE}{Fore.BLACK}{OPENAI_MODEL}{Style.RESET_ALL} Total de acciones sugeridas: {len(report['acciones_sugeridas'])}')
-
-            last_report = time.time()
-            reports += 1
-
+        if 0 < smoke < 50:
+            print('[humo] nivel bajo de humo')
         
+        elif 50 <= smoke < 200:
+            print('[humo] nivel moderado de humo')
 
-main(-34.851144, -72.14149)
+        elif smoke > 200:
+            print('[humo] niveles peligrosos de humo')
+
+        if 0 < co < 50:
+            print('[co] nivel bajo de monoxido de carbono')
+
+        elif 50 <= co < 200:
+            print('[co] nivel moderado de monoxido de carbono')
+
+        elif co > 200:
+            print('[co] niveles peligrosos de monoxido de carbono')
+
+        if 0 < ch4 < 1000:
+            print('[ch4] nivel bajo de metano')
+
+        elif 1000 < ch4 < 5000:
+            print('[ch4] nivel moderado de metano')
+
+        elif ch4 > 5000:
+            print('[ch4] niveles peligros de ch4')
+
+        time.sleep(10)
+
+
+class OpenMeteo:
+    def __init__(self, lat ,lon):
+        self.lat = lat
+        self.lon = lon
+
+    def get_wind_speed(self):
+        response = requests.get(f'https://api.open-meteo.com/v1/forecast?latitude={self.lat}&longitude={self.lon}&current=wind_speed_10m').json()['current']['wind_speed_10m']
+
+        return response
+
+    def get_precipitation(self):
+        response = requests.get(f'https://api.open-meteo.com/v1/forecast?latitude={self.lat}&longitude={self.lon}&current=precipitation').json()['current']['precipitation']
+
+        return response
+    
+    def get_maxmin_temp(self):
+        response = requests.get(f'https://api.open-meteo.com/v1/forecast?latitude={self.lat}&longitude={self.lon}&daily=temperature_2m_max,temperature_2m_min&timezone=auto').json()['daily']
+
+        maxtemp = response['temperature_2m_max'][0]
+        mintemp = response['temperature_2m_min'][0]
+
+        return [maxtemp, mintemp]
+    
+    def get_lagged_precipitation(self):
+        p = 0
+
+        end_date = (datetime.today() - timedelta(days=1)).date()
+        start_date = (end_date - timedelta(days=6)) 
+
+        response = requests.get(f'https://archive-api.open-meteo.com/v1/archive?latitude={self.lat}&longitude={self.lon}&start_date={start_date.isoformat()}&end_date={end_date.isoformat()}&daily=precipitation_sum&timezone=auto').json()['daily']['precipitation_sum']
+
+        for x in response:
+            if x == 'null' or x == None:
+                p += 0
+            
+            else:
+                p += x
+
+        return p
+    
+    def get_lagged_windspeed(self):
+        prom = 0
+
+        end_date = (datetime.today() - timedelta(days=1)).date()
+        start_date = (end_date - timedelta(days=6)) 
+    
+        response = requests.get(f'https://archive-api.open-meteo.com/v1/archive?latitude={self.lat}&longitude={self.lon}&start_date={start_date.isoformat()}&end_date={end_date.isoformat()}&daily=windspeed_10m_max&timezone=auto').json()['daily']['windspeed_10m_max']
+
+        for x in response:
+            if x == 'null' or x == None:
+                prom += 0
+            
+            else:
+                prom += x
+
+        promedio = prom / len(response)
+
+        return promedio
+
+
+class Indices:
+    def __init__(self):
+        pass
+
+    def angstrom(self):
+        """
+        Indice de angstrom, las variables deben ser a las 13:00
+        """
+
+        sensors = get_sensor_data()
+
+        I = (sensors['humidity']/20) + ((27 - sensors['temperature'])/10)
+
+
+        if I > 4.0:
+            print('[angström] Probabilidad baja de incendios')
+
+        elif I > 2.5 and I <= 4.0:
+            print('[angström] Condiciones de incendio desfavorables.')
+        
+        elif I > 2.0 and I <= 2.5:
+            print('[angström] Condiciones de incendio favorables')
+        
+        elif I <= 2.0:
+            print('[angström] Probabilidad muy alta de que se produzca un incendio.')
+
+    
+    def munger(self, w: int):
+        Munger = 1/2 * w**2
+
+        return Munger
+    
+    def nesterov_csv_today(self, lat, lon):
+        while True:
+            with open('data/nesterov.csv') as file:
+                next(file)
+
+                reader = csv.reader(file)
+
+                NI = 0
+                T15 = []
+                Tdew = []
+                rain = []
+                indices = []
+
+                for row in reader:
+                    T15.append(float(row[2]))
+                    Tdew.append(float(row[3]))
+                    rain.append(float(row[4]))
+
+
+                for i in range(len(T15)):
+                    if rain[i] > 3:
+                        NI = 0
+                    else:
+                        daily_value = (T15[i] - Tdew[i]) * T15[i]
+                        NI += daily_value
+                    
+                    indices.append(NI)
+
+                sensors = get_sensor_data()
+                rain = OpenMeteo(lat, lon).get_precipitation()
+
+                if rain >= 3:
+                    NI = 0
+                else:
+                    T15 = sensors['temperature']
+                    Tdew = float(dewpoint_from_relative_humidity(T15 * units.degC, sensors['humidity'] * units.percent).m)
+
+                    today = (T15 - Tdew) * T15
+
+                    NI += today
+
+                if NI <= 300:
+                    print('[nesterov] Sin peligro de incendio')
+
+                elif NI <= 1000:
+                    print('[nesterov] Peligro de incendio bajo')
+
+                elif NI <= 4000:
+                    print('[nesterov] Peligro de incendio medio')
+
+                elif NI <= 10000:
+                    print('[nesterov] Peligro de incendio ALTO')
+
+                else:
+                    print('[nesterov] PELIGRO DE INCENDIO EXTREMO')
+
+                time.sleep(86400)
+    
+    def angstrom_exec(self):
+        execs = 0
+        while True:
+            hour = datetime.now().time().hour
+
+            #if hour == '13' and execs == 0:
+            self.angstrom()
+
+            #if hour != '13':
+            #    execs = 0
+            time.sleep(10)
+
+class Main:
+
+    def __init__(self):
+        self.lat = '-34.98279'
+        self.lon = '-71.23943'
+
+    def init(self):
+        Process(target=generate_fire_reports, args=(self.lat, self.lon)).start()
+        #Process(target=camera_detection_yolov8).start()
+        #Process(target=chainsaw_detect, args=('output.wav',)).start()
+        Process(target=rule_thirty_exec, args=(self.lat, self.lon)).start()
+        Process(target=Indices().angstrom_exec).start()
+        Process(target=recopile_nesterov_data, args=(self.lat, self.lon)).start()
+        Process(target=Indices().nesterov_csv_today, args=(self.lat, self.lon)).start()
+        Process(target=predict_fire, args=(self.lat, self.lon)).start()
+        Process(target=check_ppm_gases).start()
+
+        print(banner)
+
+
+    def __evaluar_regla30(self, temperature: int, humidity: int, wind_speed: int):
+        risk = rule_thirty(temperature, humidity, wind_speed)
+
+        if risk == 0:
+            requests.post(ApiUrl + '/api/alert', json={'alert_status': 'max_alert'})
+
+    def __generar_reporte(temperature: int, humidity: int, wind_speed: int, lat: str, lon: str, smoke: str, wind_dir: int):
+        datos_sensores = f'''
+Temperatura: {temperature},
+Humedad: {humidity},
+Velocidad viento: {wind_speed},
+Direccion Viento: {wind_dir}
+Latitud: {lat},
+Longitud: {lon}
+Direccion: {get_address(lat, lon)}
+'''
+        response = gpt_send_message(
+            PromptGPTReport + datos_sensores
+        )
+        
+        return json.loads(response)
+
+if __name__ == "__main__":
+    #print(Indices().angstrom(25, 56))
+    Main().init()
+    #Indices().nesterov_check('-34.98279', '-71.23943')
+    #recopile_nesterov_data('-34.98279', '-71.23943')
+    #print(Indices().nesterov_csv_today('-34.98279', '-71.23943'))
