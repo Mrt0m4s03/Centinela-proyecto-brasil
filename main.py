@@ -142,43 +142,7 @@ def get_address(lat, lon):
     else:
         return None
         
-def chainsaw_detect(audioFile: str):
-    possible_chainsaw_options = [
-        'Power tool', 'Aircraft', 'Tools', 'Helicopter', 'Drill'
-    ]
 
-    while True:
-        
-        detections = []
-
-        recording = sd.rec(int(10 * 16000), samplerate=16000, channels=1, dtype='int16')
-        sd.wait()
-        wavwrite(audioFile, 16000, recording)
-
-        base_options = python.BaseOptions(model_asset_path='models/yamnet.tflite')
-        options = audio.AudioClassifierOptions(base_options=base_options, max_results=4)
-
-        with audio.AudioClassifier.create_from_options(options) as classifier:
-            sample_rate, wav_data = wavfile.read(audioFile)
-
-            audio_clip = containers.AudioData.create_from_array(
-                wav_data.astype(float) / np.iinfo(np.int16).max, sample_rate)
-            
-            classification_result_list = classifier.classify(audio_clip)
-
-            for idx, timestamp in enumerate([0, 975, 1950, 2925]):
-                classification_result = classification_result_list[idx]
-                top_category = classification_result.classifications[0].categories[0]
-
-                detections.append(top_category.category_name)
-
-        if detections:
-            if detections.count('chainsaws') >= 2:
-                print('motosierra detectada')
-
-        for p in possible_chainsaw_options:
-            if detections.count(p) >= 2:
-                print('posible motosierra detectada')
             
 
 def gpt_send_message(prompt, image=None, model='gpt-5-nano'):
@@ -596,4 +560,5 @@ if __name__ == "__main__":
     Main().init()
     #Indices().nesterov_check('-34.98279', '-71.23943')
     #recopile_nesterov_data('-34.98279', '-71.23943')
+
     #print(Indices().nesterov_csv_today('-34.98279', '-71.23943'))
