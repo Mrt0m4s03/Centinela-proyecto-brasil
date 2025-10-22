@@ -10,6 +10,7 @@ import time
 import os
 import csv
 import pandas as pd
+import torch
 import joblib
 
 from colorama import init, Fore, Back, Style
@@ -27,8 +28,10 @@ from scipy.io import wavfile
 from scipy.io.wavfile import write as wavwrite
 
 init(autoreset=True)
+torch.cuda.empty_cache()
+torch.cuda.ipc_collect()
 
-CameraURL = ''
+CameraURL = 'http://10.19.71.66/capture'
 ApiUrl = 'http://10.19.71.68:1337'
 ApiKey = ''
 PromptGPTCamera = '''
@@ -61,7 +64,7 @@ Eres un sistema experto en detección temprana de incendios forestales.
 Tu tarea es analizar datos de sensores ambientales y entregar un informe en formato JSON.
 
 Datos que recibirás:
-- MQ-2 (PPM de gases combustibles y humo)
+- MQ-2 (PPM de humo, ~20 ppm es el promedio normal, arriba de ~40 es mas elevado)
 - Velocidad del viento (km/h)
 - Temperatura (°C)
 - Humedad (%)
@@ -97,6 +100,8 @@ Formato de salida JSON:
   },
   "timestamp": "<fecha-hora UTC>"
 }
+
+la velocidad del viento es en km/h, pero deja la variable com ms
 '''
 banner = '''
 _________                __  .__              .__          
@@ -130,7 +135,7 @@ def rule_thirty(temperature: int, humidity: int, wind_speed: int):
 
 
 def get_sensor_data():
-    response = requests.get(ApiUrl + '/api/sensor_data').json()[0]
+    response = requests.get(ApiUrl + '/api/sensor_data').json()
 
     return response
 
@@ -142,7 +147,44 @@ def get_address(lat, lon):
     else:
         return None
         
+def chainsaw_detect(audioFile: str):
+    possible_chainsaw_options = [
+        'Power tool', 'Aircraft', 'Tools', 'Helicopter', 'Drill'
+    ]
 
+    while True:
+        
+        detections = []
+
+        recording = sd.rec(int(10 * 16000), samplerate=16000, channels=1, dtype='int16')
+        print('[chainsaw] recording')
+        sd.wait()
+        wavwrite(audioFile, 16000, recording)
+
+        base_options = python.BaseOptions(model_asset_path='models/yamnet.tflite')
+        options = audio.AudioClassifierOptions(base_options=base_options, max_results=4)
+
+        with audio.AudioClassifier.create_from_options(options) as classifier:
+            sample_rate, wav_data = wavfile.read(audioFile)
+
+            audio_clip = containers.AudioData.create_from_array(
+                wav_data.astype(float) / np.iinfo(np.int16).max, sample_rate)
+            
+            classification_result_list = classifier.classify(audio_clip)
+
+            for idx, timestamp in enumerate([0, 975, 1950, 2925]):
+                classification_result = classification_result_list[idx]
+                top_category = classification_result.classifications[0].categories[0]
+
+                detections.append(top_category.category_name)
+
+        if detections:
+            if detections.count('chainsaws') >= 2:
+                print('[chainsaw] MOTOSIERRA DETECTADA')
+
+        for p in possible_chainsaw_options:
+            if detections.count(p) >= 2:
+                print('[chainsaw] POSIBLE MOTOSIERRA DETECTADA')
             
 
 def gpt_send_message(prompt, image=None, model='gpt-5-nano'):
@@ -174,13 +216,15 @@ def generate_fire_reports(lat, lon):
             sensors = get_sensor_data()
 
             datos_sensores = f'''
-            Temperatura: {sensors['temperature']},
-            Humedad: {sensors['humidity']},
-            Velocidad viento: {om.get_wind_speed()},
-            Direccion Viento: {wind_dir} Grados
-            Latitud: {lat},
-            Longitud: {lon}
-            Direccion: {get_address(lat, lon)}
+Temperatura: {sensors['temperature']},
+Humedad: {sensors['humidity']},
+Velocidad viento: {sensors['wind_speed']},
+Direccion Viento: {wind_dir} Grados
+Latitud: {lat},
+Longitud: {lon}
+Direccion: {get_address(lat, lon)}
+MQ 2 PPM: {sensors['smoke']}
+
             '''
 
 
@@ -188,11 +232,30 @@ def generate_fire_reports(lat, lon):
                 PromptGPTReport + datos_sensores
             ) 
 
+            requests.post(ApiUrl + '/api/report', json=response)
             
             last_fire_detection = time.time()
             reports += 1
 
             print(response)
+
+def gpt_detect_fire():
+    while True:
+        print(requests.get(CameraURL + '/capture').content)
+        image = base64.b64encode(requests.get(CameraURL).content).decode('utf-8')
+
+        response = json.loads(gpt_send_message(PromptGPTCamera, image=image))
+
+        print(response)
+
+        if response['humo'] == True:
+            print('[gpt-camera] Humo detectado')
+
+        elif response['fuego'] == True:
+            print('[gpt-camera] Fuego detectado')
+
+        elif response['fuego'] == True and response['humo'] == True:
+            print(f'[gpt-camera] Fuego y Humo detectado')
 
 def camera_detection_yolov8():
     global smoke_detected
@@ -234,7 +297,7 @@ def rule_thirty_exec(lat, lon):
     while True:
             sensors = get_sensor_data()
 
-            risk = rule_thirty(sensors['temperature'], sensors['humidity'], om.get_wind_speed())
+            risk = rule_thirty(sensors['temperature'], sensors['humidity'], sensors['wind_speed'])
 
             if risk == 0:
                 print('[regra dos 30] riesgo de incendio maximo')
@@ -246,6 +309,8 @@ def rule_thirty_exec(lat, lon):
                 print('[regra dos 30] riesgo de incendio bajo')
 
             time.sleep(10)
+
+
 
 def predict_fire(lat, lon):
     om = OpenMeteo(lat, lon)
@@ -264,10 +329,12 @@ def predict_fire(lat, lon):
         elif month in [9, 10, 11]:
             season = 1
 
+        sensors = get_sensor_data()
+
         temps = om.get_maxmin_temp()
         maxtemp = (temps[0] * 9/5) + 32
         mintemp = (temps[1] * 9/5) + 32
-        windspeed = om.get_wind_speed() * 0.621371
+        windspeed = sensors['wind_speed'] * 0.621371
         temprange = maxtemp - mintemp
         windtempratio = windspeed / maxtemp
         today = datetime.today().timetuple().tm_yday
@@ -316,8 +383,8 @@ def check_ppm_gases():
     while True:
         sensors = get_sensor_data()
 
-        co = sensors['co']
-        ch4 = sensors['ch4']
+        #co = sensors['co']
+        #ch4 = sensors['ch4']
         co2 = sensors['co2']
         smoke = sensors['smoke']
 
@@ -330,6 +397,22 @@ def check_ppm_gases():
         elif smoke > 200:
             print('[humo] niveles peligrosos de humo')
 
+        if co2 < 400:
+            print(f'[co2] niveles normales de co2 (atmosferico)')
+
+        elif 400 < co2 < 1000:
+            print(f'[co2] nivel aceptable de co2')
+
+        elif 1000 < co2 < 2000:
+            print(f'[co2] nivel moderado/medio de co2')
+
+        elif 2000 < co2 < 5000:
+            print(f'[co2] nivel alto de co2')
+
+        if co2 > 5000:
+            print(f'[co2] niveles muy peligrosos de co2')
+
+        """
         if 0 < co < 50:
             print('[co] nivel bajo de monoxido de carbono')
 
@@ -347,6 +430,7 @@ def check_ppm_gases():
 
         elif ch4 > 5000:
             print('[ch4] niveles peligros de ch4')
+        """
 
         time.sleep(10)
 
@@ -436,12 +520,6 @@ class Indices:
         
         elif I <= 2.0:
             print('[angström] Probabilidad muy alta de que se produzca un incendio.')
-
-    
-    def munger(self, w: int):
-        Munger = 1/2 * w**2
-
-        return Munger
     
     def nesterov_csv_today(self, lat, lon):
         while True:
@@ -519,10 +597,11 @@ class Main:
         self.lat = '-34.98279'
         self.lon = '-71.23943'
 
+        print(banner)
+
     def init(self):
         Process(target=generate_fire_reports, args=(self.lat, self.lon)).start()
-        #Process(target=camera_detection_yolov8).start()
-        #Process(target=chainsaw_detect, args=('output.wav',)).start()
+        Process(target=chainsaw_detect, args=('output.wav',)).start()
         Process(target=rule_thirty_exec, args=(self.lat, self.lon)).start()
         Process(target=Indices().angstrom_exec).start()
         Process(target=recopile_nesterov_data, args=(self.lat, self.lon)).start()
@@ -530,7 +609,8 @@ class Main:
         Process(target=predict_fire, args=(self.lat, self.lon)).start()
         Process(target=check_ppm_gases).start()
 
-        print(banner)
+        #Process(target=gpt_detect_fire).start()
+        #Process(target=camera_detection_yolov8).start()
 
 
     def __evaluar_regla30(self, temperature: int, humidity: int, wind_speed: int):
@@ -548,6 +628,7 @@ Direccion Viento: {wind_dir}
 Latitud: {lat},
 Longitud: {lon}
 Direccion: {get_address(lat, lon)}
+MQ-2 PPM: {smoke}
 '''
         response = gpt_send_message(
             PromptGPTReport + datos_sensores
@@ -560,5 +641,4 @@ if __name__ == "__main__":
     Main().init()
     #Indices().nesterov_check('-34.98279', '-71.23943')
     #recopile_nesterov_data('-34.98279', '-71.23943')
-
     #print(Indices().nesterov_csv_today('-34.98279', '-71.23943'))
